@@ -7,9 +7,26 @@
 #include <sys/socket.h>
 #include <unistd.h>
 
+/*** defines ***/
+
 #define BUFFER_SIZE 1500
-const char *const reply_200 = "HTTP/1.1 200 OK\r\n\r\n";
-const char *const reply_404 = "HTTP/1.1 404 Not Found\r\n\r\n";
+
+/*** constants ***/
+
+char const *const reply_200 = "HTTP/1.1 200 OK\r\n\r\n";
+char const *const reply_404 = "HTTP/1.1 404 Not Found\r\n\r\n";
+
+char const *const fmt_reply_200 =
+    /* Statue line */
+    "HTTP/1.1 200 OK\r\n"
+    /* Headers */
+    "Content-Type: text/plain\r\n"
+    "Content-Length: %d\r\n"
+    "\r\n"
+    /* Response body */
+    "%s";
+
+/*** exec ***/
 
 int main()
 {
@@ -66,41 +83,63 @@ int main()
     }
     printf("Client connected\n");
 
-    int bytes_recv, bytes_sent;
-    char buffer[BUFFER_SIZE];
-    int live = 2;
-    while (live--)
+    int recv_numbytes, sent_numbytes;
+    char recv_buf[BUFFER_SIZE];
+    char send_buf[BUFFER_SIZE];
+    char *echo_str;
+    char const *reply_str;
+    while (1)
     {
-        bytes_recv = recv(client_fd, buffer, BUFFER_SIZE - 1, 0);
-        if (bytes_recv == -1)
+        recv_numbytes = recv(client_fd, recv_buf, BUFFER_SIZE - 1, 0);
+        if (recv_numbytes == -1)
         {
             printf("Recv failed: %s \n", strerror(errno));
             return 1;
         }
-        else if (bytes_recv == 0)
+        else if (recv_numbytes == 0)
         {
             printf("Connection closed\n");
+            break;
         }
         else
         {
-            printf("Received message success\nlength=%d\n---content-beg---\n%s---content-end---\n", bytes_recv, buffer);
+            printf("Received message success:\n"
+                   "<length=%d>\n"
+                   "/***content-beg***/\n"
+                   "%s<end>\n"
+                   "/***content-end***/\n",
+                   recv_numbytes, recv_buf);
         }
 
-        if (strncmp(buffer, "GET / ", 6) == 0)
+        if (strncmp(recv_buf, "GET /echo/", /* first n chars */ strlen("GET /echo/")) == 0)
         {
-            if ((bytes_sent = send(client_fd, reply_200, strlen(reply_200), 0)) == -1)
+            if ((echo_str = strtok(/* first char after request str */ recv_buf + strlen("GET /echo/"), " ")))
             {
-                printf("Send failed: %s \n", strerror(errno));
-                return 1;
+                sprintf(send_buf, fmt_reply_200, /* length of `echo_str` */ (int)strlen(echo_str), echo_str);
+                reply_str = send_buf;
             }
+        }
+        else if (strncmp(recv_buf, "GET / ", strlen("GET / ")) == 0)
+        {
+            reply_str = reply_200;
         }
         else
         {
-            if ((bytes_sent = send(client_fd, reply_404, strlen(reply_404), 0)) == -1)
-            {
-                printf("Send failed: %s \n", strerror(errno));
-                return 1;
-            }
+            reply_str = reply_404;
+        }
+
+        if ((sent_numbytes = send(client_fd, reply_str, strlen(reply_str), 0)) == -1)
+        {
+            printf("Send failed: %s \n", strerror(errno));
+            return 1;
+        }
+        else
+        {
+            printf("Send message success:\n"
+                   "/***content-beg***/\n"
+                   "%s<end>\n"
+                   "/***content-end***/\n",
+                   reply_str);
         }
     }
 
