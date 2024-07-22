@@ -11,6 +11,10 @@
 
 #define BUFFER_SIZE 1500
 
+#define REQ_USER_AGENT "GET /user-agent "
+#define REQ_ECHO "GET /echo/"
+#define REQ_ROOT "GET / "
+
 /*** constants ***/
 
 char const *const reply_200 = "HTTP/1.1 200 OK\r\n\r\n";
@@ -84,13 +88,14 @@ int main()
     printf("Client connected\n");
 
     int recv_numbytes, sent_numbytes;
-    char recv_buf[BUFFER_SIZE];
-    char send_buf[BUFFER_SIZE];
-    char *echo_str;
-    char const *reply_str;
+    char pc_recv_buf[BUFFER_SIZE];
+    char pc_send_buf[BUFFER_SIZE];
+    char pc_temp_buf[BUFFER_SIZE];
+    char *pc_echo_str;
+    char const *pc_reply_str;
     while (1)
     {
-        recv_numbytes = recv(client_fd, recv_buf, BUFFER_SIZE - 1, 0);
+        recv_numbytes = recv(client_fd, pc_recv_buf, BUFFER_SIZE - 1, 0);
         if (recv_numbytes == -1)
         {
             printf("Recv failed: %s \n", strerror(errno));
@@ -108,27 +113,46 @@ int main()
                    "/***content-beg***/\n"
                    "%s<end>\n"
                    "/***content-end***/\n",
-                   recv_numbytes, recv_buf);
+                   recv_numbytes, pc_recv_buf);
         }
 
-        if (strncmp(recv_buf, "GET /echo/", /* first n chars */ strlen("GET /echo/")) == 0)
+        if (strncmp(pc_recv_buf, REQ_USER_AGENT, /* prefix length */ strlen(REQ_USER_AGENT)) == 0)
         {
-            if ((echo_str = strtok(/* first char after request str */ recv_buf + strlen("GET /echo/"), " ")))
+            char *pc_start, *pc_end;
+            pc_start = strstr(pc_recv_buf + strlen(REQ_USER_AGENT), "User-Agent: ");
+            pc_end = strstr(pc_start, "\r\n");
+            if (pc_start != NULL && pc_end != NULL)
             {
-                sprintf(send_buf, fmt_reply_200, /* length of `echo_str` */ (int)strlen(echo_str), echo_str);
-                reply_str = send_buf;
+                pc_start += strlen("User-Agent: ");
+                memcpy(pc_temp_buf, pc_start, (pc_end - pc_start));
+                pc_temp_buf[pc_end - pc_start] = '\0';
+                sprintf(pc_send_buf, fmt_reply_200, (int)strlen(pc_temp_buf), pc_temp_buf);
+                pc_reply_str = pc_send_buf;
+            }
+            else
+            {
+                printf("parse error: can't find header User-Agent\n");
+                return 1;
             }
         }
-        else if (strncmp(recv_buf, "GET / ", strlen("GET / ")) == 0)
+        else if (strncmp(pc_recv_buf, REQ_ECHO, strlen(REQ_ECHO)) == 0)
         {
-            reply_str = reply_200;
+            if ((pc_echo_str = strtok(/* first char after request str */ pc_recv_buf + strlen(REQ_ECHO), " ")))
+            {
+                sprintf(pc_send_buf, fmt_reply_200, (int)strlen(pc_echo_str), pc_echo_str);
+                pc_reply_str = pc_send_buf;
+            }
+        }
+        else if (strncmp(pc_recv_buf, REQ_ROOT, strlen(REQ_ROOT)) == 0)
+        {
+            pc_reply_str = reply_200;
         }
         else
         {
-            reply_str = reply_404;
+            pc_reply_str = reply_404;
         }
 
-        if ((sent_numbytes = send(client_fd, reply_str, strlen(reply_str), 0)) == -1)
+        if ((sent_numbytes = send(client_fd, pc_reply_str, strlen(pc_reply_str), 0)) == -1)
         {
             printf("Send failed: %s \n", strerror(errno));
             return 1;
@@ -139,7 +163,7 @@ int main()
                    "/***content-beg***/\n"
                    "%s<end>\n"
                    "/***content-end***/\n",
-                   reply_str);
+                   pc_reply_str);
         }
     }
 
