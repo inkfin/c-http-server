@@ -7,13 +7,17 @@
 #include <sys/socket.h>
 #include <unistd.h>
 
+#define BUFFER_SIZE 1500
+const char *const reply_200 = "HTTP/1.1 200 OK\r\n\r\n";
+const char *const reply_404 = "HTTP/1.1 404 Not Found\r\n\r\n";
+
 int main()
 {
     // Disable output buffering
     setbuf(stdout, NULL);
     setbuf(stderr, NULL);
 
-    int server_fd;
+    int server_fd, client_fd;
     socklen_t client_addr_len;
     struct sockaddr_in client_addr;
 
@@ -55,11 +59,50 @@ int main()
     printf("Waiting for a client to connect...\n");
     client_addr_len = sizeof(client_addr);
 
-    int fd = accept(server_fd, (struct sockaddr *)&client_addr, &client_addr_len);
+    if ((client_fd = accept(server_fd, (struct sockaddr *)&client_addr, &client_addr_len)) == -1)
+    {
+        printf("Create client failed: %s \n", strerror(errno));
+        return 1;
+    }
     printf("Client connected\n");
 
-    char *reply = "HTTP/1.1 200 OK\r\n\r\n";
-    int bytes_sent = send(fd, reply, strlen(reply), 0);
+    int bytes_recv, bytes_sent;
+    char buffer[BUFFER_SIZE];
+    int live = 2;
+    while (live--)
+    {
+        bytes_recv = recv(client_fd, buffer, BUFFER_SIZE - 1, 0);
+        if (bytes_recv == -1)
+        {
+            printf("Recv failed: %s \n", strerror(errno));
+            return 1;
+        }
+        else if (bytes_recv == 0)
+        {
+            printf("Connection closed\n");
+        }
+        else
+        {
+            printf("Received message success\nlength=%d\n---content-beg---\n%s---content-end---\n", bytes_recv, buffer);
+        }
+
+        if (strncmp(buffer, "GET / ", 6) == 0)
+        {
+            if ((bytes_sent = send(client_fd, reply_200, strlen(reply_200), 0)) == -1)
+            {
+                printf("Send failed: %s \n", strerror(errno));
+                return 1;
+            }
+        }
+        else
+        {
+            if ((bytes_sent = send(client_fd, reply_404, strlen(reply_404), 0)) == -1)
+            {
+                printf("Send failed: %s \n", strerror(errno));
+                return 1;
+            }
+        }
+    }
 
     close(server_fd);
 
