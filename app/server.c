@@ -1,3 +1,4 @@
+#include <assert.h>
 #include <errno.h>
 #include <netinet/in.h>
 #include <netinet/ip.h>
@@ -5,6 +6,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/select.h>
 #include <sys/socket.h>
 #include <unistd.h>
 
@@ -12,16 +14,17 @@
 
 /* safe buffer size of a package */
 #define BUFFER_SIZE 1500
-#define MAX_PTHREAD_NUM 8
+#define MAX_PTHREAD_NUM 32
 
-#define REQ_USER_AGENT "GET /user-agent "
-#define REQ_FILE "GET /files/"
-#define REQ_ECHO "GET /echo/"
-#define REQ_ROOT "GET / "
+#define REQ_USER_AGENT "/user-agent"
+#define REQ_FILE "/files/"
+#define REQ_ECHO "/echo/"
+#define REQ_ROOT "/"
 
 /*** constants ***/
 
 char const* const reply_200 = "HTTP/1.1 200 OK\r\n\r\n";
+char const* const reply_201 = "HTTP/1.1 201 Created\r\n\r\n";
 char const* const reply_404 = "HTTP/1.1 404 Not Found\r\n\r\n";
 
 char const* const fmt_reply_200 =
@@ -34,16 +37,69 @@ char const* const fmt_reply_200 =
     /* Response body */
     "%s";
 
+/*** enums ***/
+
+typedef enum {
+    REQ_TYPE_UNDEF,
+    REQ_TYPE_GET,
+    REQ_TYPE_POST,
+    REQ_TYPE_ENUM_LENGTH,
+} REQ_TYPE;
+
+typedef enum {
+    HTTP_VUNDEF,
+    HTTP_V11, /* HTTP/1.1 */
+} HTTP_VERSION;
+
 /*** structs ***/
 
-struct g_args {
+typedef struct {
+    /* request line */
+    int req_type;
+    char* request;
+    int http_ver;
+    /* header */
+    char* host;
+    char* user_agent;
+    char* accept;
+    char* content_type;
+    size_t content_length;
+    /* request body */
+    char* body;
+} headerData;
+
+typedef struct {
+    int client_fd;
+} tParams;
+
+struct gArgs {
     char* file_path;
 } g_args = { 0 };
 
 /*** free ***/
 
-void free_resource()
+void g_free_resource()
 {
+    free(g_args.file_path);
+}
+
+void free_header_data(headerData* data)
+{
+    if (data == NULL)
+        return;
+    if (data->request != NULL)
+        free(data->request);
+    if (data->host != NULL)
+        free(data->host);
+    if (data->user_agent != NULL)
+        free(data->user_agent);
+    if (data->accept != NULL)
+        free(data->accept);
+    if (data->content_type != NULL)
+        free(data->content_type);
+    if (data->body != NULL)
+        free(data->body);
+    free(data);
 }
 
 /*** args ***/
@@ -57,7 +113,9 @@ int parse_args(int argc, char* argv[])
     for (size_t i = 1; i < argc; ++i) {
         if (strncmp(argv[i], "--", 2) == 0) {
             if (strcmp(argv[i] + 2, "directory") == 0 && i + 1 < argc) {
-                g_args.file_path = argv[i + 1];
+                g_args.file_path = malloc(strlen(argv[i + 1]) + 1);
+                memcpy(g_args.file_path, argv[i + 1], strlen(argv[i + 1]));
+                g_args.file_path[strlen(argv[i + 1])] = '\0';
                 ++i;
             }
         }
@@ -113,98 +171,271 @@ int read_file(char* file_path, char* buffer, size_t buf_size)
     return 0;
 }
 
+int write_file(char* file_path, char* buffer)
+{
+    FILE* fp = fopen(file_path, "w");
+    if (fp != NULL) {
+        fprintf(fp, "%s", buffer);
+        fclose(fp);
+    }
+    return 0;
+}
+
+/*** header parser ***/
+
+#define MATCH_STRING(_str) strncmp(p_type_beg, _str, p_type_end - p_type_beg) == 0
+
+int parse_header(char const* const header_beg, char** end_ptr, headerData* data)
+{
+    char const* p_line_beg = header_beg;
+
+    while (*p_line_beg != '\r' && *p_line_beg != '\n') {
+        char const* const p_line_end = strstr(p_line_beg, "\r\n");
+        char const* const p_type_beg = p_line_beg;
+        char const* const p_type_end = strchr(p_type_beg, ':');
+
+        p_line_beg = p_type_end + 2;
+
+        if (MATCH_STRING("Host")) {
+            data->host = malloc(sizeof(char) * (p_line_end - p_line_beg + 1));
+            memcpy(data->host, p_line_beg, (p_line_end - p_line_beg));
+            data->host[p_line_end - p_line_beg] = '\0';
+            printf("data->host = |%s|\n", data->host);
+        } else if (MATCH_STRING("User-Agent")) {
+            data->user_agent = malloc(sizeof(char) * (p_line_end - p_line_beg + 1));
+            memcpy(data->user_agent, p_line_beg, (p_line_end - p_line_beg));
+            data->user_agent[p_line_end - p_line_beg] = '\0';
+            printf("data->user_agent = |%s|\n", data->user_agent);
+        } else if (MATCH_STRING("Accept")) {
+            data->accept = malloc(sizeof(char) * (p_line_end - p_line_beg + 1));
+            memcpy(data->accept, p_line_beg, (p_line_end - p_line_beg));
+            data->accept[p_line_end - p_line_beg] = '\0';
+            printf("data->accept = |%s|\n", data->accept);
+        } else if (MATCH_STRING("Content-Type")) {
+            data->content_type = malloc(sizeof(char) * (p_line_end - p_line_beg + 1));
+            memcpy(data->content_type, p_line_beg, (p_line_end - p_line_beg));
+            data->content_type[p_line_end - p_line_beg] = '\0';
+            printf("data->content_type = |%s|\n", data->content_type);
+        } else if (MATCH_STRING("Content-Length")) {
+            int tmp_errno = errno;
+            errno = 0;
+            char* ptr;
+            data->content_length = strtoul(p_line_beg, &ptr, 10);
+            if (errno != 0) {
+                printf("[ERROR][parse_header] content_length error: %s\n", strerror(errno));
+                errno = tmp_errno;
+                return -1;
+            }
+            errno = tmp_errno;
+            printf("data->content_length = |%lu|\n", data->content_length);
+        } else {
+            char tstr[32];
+            size_t tstr_len = (p_line_end - p_line_beg > 31) ? 31 : p_line_end - p_line_beg;
+            memcpy(tstr, p_line_beg, tstr_len);
+            tstr[tstr_len] = '\0';
+            printf("[WARNING][parse_header] unhandled header type: %s\n", tstr);
+        }
+
+        p_line_beg = p_line_end + 2;
+    }
+    *end_ptr = (char*)p_line_beg;
+    return 0;
+}
+
+#undef MATCH_STRING
+
+/* (*unsafe) get alloc copy of request */
+headerData* parse_request(char const* const request)
+{
+    headerData* data = malloc(sizeof(headerData));
+    if (data == NULL) {
+        puts("[ERROR][parse_request] malloc for headerData failed!");
+        return NULL;
+    }
+    *data = (headerData) { 0 };
+
+    char const* p_beg = request;
+    /* req_type */
+    {
+        char const* const p_end = strchr(p_beg, ' ');
+        if (p_end == NULL) {
+            puts("[ERROR][parse_request] can't locate req_type");
+            goto HANDLE_ERROR;
+        }
+        if (strncmp(p_beg, "GET", p_end - p_beg) == 0) {
+            data->req_type = REQ_TYPE_GET;
+            puts("data->req_type = REQ_TYPE_GET");
+        } else if (strncmp(p_beg, "POST", p_end - p_beg) == 0) {
+            data->req_type = REQ_TYPE_POST;
+            puts("data->req_type = REQ_TYPE_POST");
+        } else {
+            puts("[WARNING][parse_request] undefined REQ_TYPE_POST!");
+        }
+        p_beg = p_end + 1;
+    }
+    /* request */
+    {
+        char const* const p_end = strchr(p_beg, ' ');
+        if (p_end == NULL) {
+            puts("[ERROR][parse_request] can't locate request");
+            goto HANDLE_ERROR;
+        }
+        data->request = malloc(sizeof(char) * (p_end - p_beg + 1));
+        memcpy(data->request, p_beg, p_end - p_beg);
+        data->request[p_end - p_beg] = '\0';
+        printf("data->request = |%s|\n", data->request);
+        p_beg = p_end + 1;
+    }
+    /* http_ver */
+    {
+        char const* const p_end = strstr(p_beg, "\r\n");
+        if (p_end == NULL) {
+            puts("[ERROR][parse_request] can't locate http_ver");
+            goto HANDLE_ERROR;
+        }
+        if (strncmp(p_beg, "HTTP/1.1", strlen("HTTP/1.1")) == 0) {
+            data->http_ver = HTTP_V11;
+        } else {
+            puts("[ERROR][parse_request] http version undefined!");
+            data->http_ver = HTTP_VUNDEF;
+        }
+        p_beg = p_end + 2;
+    }
+    /* headers */
+    {
+        char* end_ptr = NULL;
+        if (parse_header(p_beg, &end_ptr, data) != 0) {
+            goto HANDLE_ERROR;
+        }
+        p_beg = end_ptr;
+    }
+    /* body */
+    {
+        char const* const p_body_beg = strstr(request, "\r\n\r\n") + strlen("\r\n\r\n");
+        data->body = malloc(sizeof(char) * (strlen(p_body_beg) + 1));
+        memcpy(data->body, p_body_beg, strlen(p_body_beg));
+        data->body[strlen(p_body_beg)] = '\0';
+        printf("data->body: \n%s<end>\n\n", data->body);
+    }
+
+    return data;
+
+HANDLE_ERROR:
+    free_header_data(data);
+    return NULL;
+}
+
 /*** threads ***/
 
 /* pthread func that handle one client request */
-void* handle_connection(void* pclient_fd)
+void* handle_connection(void* p_tparams)
 {
-    int client_fd = *(int*)pclient_fd;
+    int client_fd = ((tParams*)p_tparams)->client_fd;
+
     while (1) {
         char sz_recv_buf[BUFFER_SIZE];
         char sz_send_buf[BUFFER_SIZE];
-        char const* sz_send_message;
+        char const* sz_send_message = reply_404;
 
-        const int recv_numbytes = recv(client_fd, sz_recv_buf, BUFFER_SIZE - 1, 0);
+        ssize_t const recv_numbytes = recv(client_fd, sz_recv_buf, BUFFER_SIZE - 1, 0);
         if (recv_numbytes == -1) {
             printf("Recv failed: %s \n", strerror(errno));
-            return NULL;
+            break;
         } else if (recv_numbytes == 0) {
-            printf("Connection closed\n");
+            printf("Connection %d closed\n", client_fd);
             break;
         } else {
             printf("Received message success:\n"
-                   "<length=%d>\n"
+                   "<length=%ld>\n"
                    "/***content-beg***/\n"
                    "%s<end>\n"
                    "/***content-end***/\n",
                 recv_numbytes, sz_recv_buf);
         }
 
-        if (strncmp(sz_recv_buf, REQ_USER_AGENT, /* prefix length */ strlen(REQ_USER_AGENT)) == 0) {
-            char const* psz_beg = strstr(sz_recv_buf + strlen(REQ_USER_AGENT), "User-Agent: ");
-            char const* const psz_end = strstr(psz_beg, "\r\n");
-            if (psz_beg != NULL && psz_end != NULL) {
-                psz_beg += strlen("User-Agent: ");
-                char sz_temp_buf[BUFFER_SIZE];
-                memcpy(sz_temp_buf, psz_beg, (psz_end - psz_beg));
-                sz_temp_buf[psz_end - psz_beg] = '\0';
-                sprintf(sz_send_buf, fmt_reply_200, "text/plain", strlen(sz_temp_buf), sz_temp_buf);
-                sz_send_message = sz_send_buf;
-            } else {
-                printf("parse error: can't find header User-Agent\n");
-                sz_send_message = reply_404;
-            }
-        } else if (strncmp(sz_recv_buf, REQ_FILE, strlen(REQ_FILE)) == 0) {
-            char const* const psz_beg = strstr(sz_recv_buf, REQ_FILE) + strlen(REQ_FILE);
-            char const* const psz_end = strstr(psz_beg, " ");
-            if (psz_end != NULL && g_args.file_path != NULL) {
-                LOCAL_STR_N_COPY(psz_beg, psz_end - psz_beg, file_name);
-                LOCAL_STR_CONCAT(g_args.file_path, file_name, sz_full_path);
-                printf("[REQ_FILE]: try load from file: %s\n", file_name);
-                size_t buf_size;
-                if (file_exists(sz_full_path) && (buf_size = file_size(sz_full_path)) != (size_t)-1) {
-                    printf("[REQ_FILE] load from file full path: %s\n", sz_full_path);
-                    char sz_temp_buf[buf_size + 1];
-                    read_file(sz_full_path, sz_temp_buf, buf_size);
-                    sz_temp_buf[buf_size] = '\0';
-                    printf("<Length:%lu>\n=== read content: ===\n%s\n=====================\n", buf_size, sz_temp_buf);
-                    sprintf(sz_send_buf, fmt_reply_200, "application/octet-stream", strlen(sz_temp_buf), sz_temp_buf);
+        headerData* palloc_hd = parse_request(sz_recv_buf);
+        if (palloc_hd != NULL) {
+            if (palloc_hd->req_type == REQ_TYPE_GET) {
+                /* GET */
+                if (strcmp(palloc_hd->request, REQ_USER_AGENT) == 0) {
+                    sprintf(sz_send_buf, fmt_reply_200, "text/plain", strlen(palloc_hd->user_agent), palloc_hd->user_agent);
                     sz_send_message = sz_send_buf;
+                } else if (strncmp(palloc_hd->request, REQ_FILE, strlen(REQ_FILE)) == 0) {
+                    if (g_args.file_path == NULL) {
+                        printf("[ERROR][REQ_GET_FILE]: target files requires path arguments '--directory'\n");
+                        sz_send_message = reply_404;
+                    } else {
+                        char const* const p_beg = palloc_hd->request + strlen(REQ_FILE);
+                        LOCAL_STR_COPY(p_beg, file_name);
+                        LOCAL_STR_CONCAT(g_args.file_path, file_name, sz_full_path);
+                        printf("[INFO][REQ_GET_FILE] load from file full path: %s\n", sz_full_path);
+                        size_t buf_size;
+                        if (file_exists(sz_full_path) && (buf_size = file_size(sz_full_path)) != (size_t)-1) {
+                            char sz_temp_buf[buf_size + 1];
+                            read_file(sz_full_path, sz_temp_buf, buf_size);
+                            sz_temp_buf[buf_size] = '\0';
+                            printf("=== read content: ===\n%s\n=====================\n", sz_temp_buf);
+                            sprintf(sz_send_buf, fmt_reply_200, "application/octet-stream", strlen(sz_temp_buf), sz_temp_buf);
+                            sz_send_message = sz_send_buf;
+                        } else {
+                            printf("[ERROR][REQ_GET_FILE]: file `%s` doesn't exists\n", file_name);
+                            sz_send_message = reply_404;
+                        }
+                    }
+                } else if (strncmp(palloc_hd->request, REQ_ECHO, strlen(REQ_ECHO)) == 0) {
+                    char const* const sz_echo_str = palloc_hd->request + strlen(REQ_ECHO);
+                    sprintf(sz_send_buf, fmt_reply_200, "text/plain", strlen(sz_echo_str), sz_echo_str);
+                    sz_send_message = sz_send_buf;
+                } else if (strcmp(palloc_hd->request, REQ_ROOT) == 0) {
+                    sz_send_message = reply_200;
                 } else {
-                    printf("[REQ_FILE]: file `%s` doesn't exists\n", file_name);
+                    sz_send_message = reply_404;
+                }
+            } else if (palloc_hd->req_type == REQ_TYPE_POST) {
+                /* POST */
+                if (strncmp(palloc_hd->request, REQ_FILE, strlen(REQ_FILE)) == 0) {
+                    if (strncmp(palloc_hd->content_type, "application/octet-stream", strlen("application/octet-stream")) == 0) {
+                        /* request write to file */
+                        if (g_args.file_path == NULL) {
+                            printf("[ERROR][REQ_POST_FILE]: post files requires path arguments '--directory'\n");
+                            sz_send_message = reply_404;
+                        } else {
+                            char const* const p_beg = palloc_hd->request + strlen(REQ_FILE);
+                            LOCAL_STR_COPY(p_beg, file_name);
+                            LOCAL_STR_CONCAT(g_args.file_path, file_name, sz_full_path);
+                            printf("[INFO][REQ_POST_FILE]: target file full path: %s\ncontent: \n|%s|\n", sz_full_path, palloc_hd->body);
+                            write_file(sz_full_path, palloc_hd->body);
+                            sz_send_message = reply_201;
+                        }
+                    } else {
+                        sz_send_message = reply_404;
+                    }
+                } else {
                     sz_send_message = reply_404;
                 }
             } else {
-                printf("[REQ_FILE]: get files requires path arguments '--directory'\n");
+                puts("[ERROR]: Request type undefined");
                 sz_send_message = reply_404;
             }
-        } else if (strncmp(sz_recv_buf, REQ_ECHO, strlen(REQ_ECHO)) == 0) {
-            // first char after request str
-            char const* const sz_echo_str = strtok(sz_recv_buf + strlen(REQ_ECHO), " ");
-            if (sz_echo_str) {
-                sprintf(sz_send_buf, fmt_reply_200, "text/plain", strlen(sz_echo_str), sz_echo_str);
-                sz_send_message = sz_send_buf;
-            }
-        } else if (strncmp(sz_recv_buf, REQ_ROOT, strlen(REQ_ROOT)) == 0) {
-            sz_send_message = reply_200;
-        } else {
-            sz_send_message = reply_404;
-        }
 
-        const int sent_numbytes = send(client_fd, sz_send_message, strlen(sz_send_message), 0);
-        if (sent_numbytes == -1) {
-            printf("Send failed: %s \n", strerror(errno));
-            return NULL;
-        } else {
-            printf("Send message success:\n"
-                   "/***content-beg***/\n"
-                   "%s<end>\n"
-                   "/***content-end***/\n",
-                sz_send_message);
+            const int sent_numbytes = send(client_fd, sz_send_message, strlen(sz_send_message), 0);
+            if (sent_numbytes == -1) {
+                printf("Send failed: %s \n", strerror(errno));
+            } else {
+                printf("Send message success:\n"
+                       "/***content-beg***/\n"
+                       "%s<end>\n"
+                       "/***content-end***/\n",
+                    sz_send_message);
+            }
         }
+        free_header_data(palloc_hd);
     }
 
-    return NULL;
+    close(client_fd);
+    free(p_tparams);
+
+    pthread_exit(NULL);
 }
 
 /*** exec ***/
@@ -219,8 +450,8 @@ int main(int argc, char* argv[])
 
     int server_fd,
         client_fd;
-    socklen_t client_addr_len;
     struct sockaddr_in client_addr;
+    socklen_t client_addr_len = sizeof(client_addr);
 
     server_fd = socket(AF_INET, SOCK_STREAM, 0);
     if (server_fd == -1) {
@@ -254,36 +485,37 @@ int main(int argc, char* argv[])
     }
 
     printf("Waiting for a client to connect...\n");
-    client_addr_len = sizeof(client_addr);
 
     // create pthread
-    pthread_t arr_pthread[MAX_PTHREAD_NUM];
-    int arr_pthread_ret[MAX_PTHREAD_NUM];
-    int pthread_idx = 0;
 
     while (1) {
         if ((client_fd = accept(server_fd, (struct sockaddr*)&client_addr, &client_addr_len)) == -1) {
             printf("Create client failed: %s \n", strerror(errno));
             break;
         } else {
-            arr_pthread_ret[pthread_idx] = pthread_create(&arr_pthread[pthread_idx], NULL, handle_connection, (void*)&client_fd);
-            ++pthread_idx;
-            printf("Client connected\n");
+            tParams* p_tparams = malloc(sizeof(tParams));
+            p_tparams->client_fd = client_fd;
+
+            pthread_t thread_id;
+            if (pthread_create(&thread_id, NULL, handle_connection, (void*)p_tparams) != 0) {
+                perror("Tread creation failed\n");
+                close(client_fd);
+                free(p_tparams);
+                continue;
+            }
+            printf("Client %d connected\n", client_fd);
+            pthread_detach(thread_id);
         }
-    }
-
-    for (int i = 0; i < MAX_PTHREAD_NUM; ++i) {
-        pthread_join(arr_pthread[i], NULL);
-    }
-
-    for (int i = 0; i < MAX_PTHREAD_NUM; ++i) {
-        printf("pthread[%d] returns %d", i, arr_pthread_ret[i]);
     }
 
     close(server_fd);
 
-SAFE_RETURN:
-    free_resource();
+    g_free_resource();
+    exit(EXIT_SUCCESS);
 
-    return 0;
+SAFE_RETURN:
+    close(server_fd);
+
+    g_free_resource();
+    exit(EXIT_FAILURE);
 }
