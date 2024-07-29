@@ -10,10 +10,12 @@
 
 /*** defines ***/
 
+/* safe buffer size of a package */
 #define BUFFER_SIZE 1500
 #define MAX_PTHREAD_NUM 8
 
 #define REQ_USER_AGENT "GET /user-agent "
+#define REQ_FILE "GET /files/"
 #define REQ_ECHO "GET /echo/"
 #define REQ_ROOT "GET / "
 
@@ -26,11 +28,90 @@ char const* const fmt_reply_200 =
     /* Statue line */
     "HTTP/1.1 200 OK\r\n"
     /* Headers */
-    "Content-Type: text/plain\r\n"
-    "Content-Length: %d\r\n"
+    "Content-Type: %s\r\n"
+    "Content-Length: %lu\r\n"
     "\r\n"
     /* Response body */
     "%s";
+
+/*** structs ***/
+
+struct g_args {
+    char* file_path;
+} g_args = { 0 };
+
+/*** free ***/
+
+void free_resource()
+{
+}
+
+/*** args ***/
+
+int parse_args(int argc, char* argv[])
+{
+    if (argc <= 1) {
+        // no arguments early return
+        return 0;
+    }
+    for (size_t i = 1; i < argc; ++i) {
+        if (strncmp(argv[i], "--", 2) == 0) {
+            if (strcmp(argv[i] + 2, "directory") == 0 && i + 1 < argc) {
+                g_args.file_path = argv[i + 1];
+                ++i;
+            }
+        }
+    }
+    return 0;
+}
+
+/*** I/O ***/
+
+#define LOCAL_STR_N_COPY(_src, n, buffer_name) \
+    char buffer_name[n + 1];                   \
+    memcpy(buffer_name, _src, n);              \
+    buffer_name[n] = '\0';
+
+#define LOCAL_STR_COPY(_src, buffer_name) \
+    LOCAL_STR_N_COPY(_src, strlen(_src), buffer_name)
+
+#define LOCAL_STR_CONCAT(_s1, _s2, buffer_name)      \
+    char buffer_name[strlen(_s1) + strlen(_s2) + 1]; \
+    strcat(buffer_name, _s1);                        \
+    strcat(buffer_name + strlen(_s1), _s2);          \
+    buffer_name[strlen(_s1) + strlen(_s2)] = '\0';
+
+int file_exists(char* file_path)
+{
+    return access(file_path, F_OK) == 0;
+}
+
+size_t file_size(char* file_path)
+{
+    size_t buf_size = -1;
+    FILE* fp = fopen(file_path, "r");
+    if (fp != NULL) {
+        if (fseek(fp, 0L, SEEK_END) == 0) {
+            buf_size = ftell(fp);
+        }
+        fclose(fp);
+    }
+    return buf_size;
+}
+
+int read_file(char* file_path, char* buffer, size_t buf_size)
+{
+    FILE* fp = fopen(file_path, "r");
+    if (fp != NULL) {
+        size_t new_len = fread(buffer, sizeof(char), buf_size, fp);
+        if (ferror(fp) != 0) {
+            fputs("[Error] read_file", stderr);
+            return -1;
+        }
+        fclose(fp);
+    }
+    return 0;
+}
 
 /*** threads ***/
 
@@ -60,26 +141,48 @@ void* handle_connection(void* pclient_fd)
         }
 
         if (strncmp(sz_recv_buf, REQ_USER_AGENT, /* prefix length */ strlen(REQ_USER_AGENT)) == 0) {
-            char *pc_start, *pc_end;
-            pc_start = strstr(sz_recv_buf + strlen(REQ_USER_AGENT), "User-Agent: ");
-            pc_end = strstr(pc_start, "\r\n");
-            if (pc_start != NULL && pc_end != NULL) {
+            char const* psz_beg = strstr(sz_recv_buf + strlen(REQ_USER_AGENT), "User-Agent: ");
+            char const* const psz_end = strstr(psz_beg, "\r\n");
+            if (psz_beg != NULL && psz_end != NULL) {
+                psz_beg += strlen("User-Agent: ");
                 char sz_temp_buf[BUFFER_SIZE];
-
-                pc_start += strlen("User-Agent: ");
-                memcpy(sz_temp_buf, pc_start, (pc_end - pc_start));
-                sz_temp_buf[pc_end - pc_start] = '\0';
-                sprintf(sz_send_buf, fmt_reply_200, (int)strlen(sz_temp_buf), sz_temp_buf);
+                memcpy(sz_temp_buf, psz_beg, (psz_end - psz_beg));
+                sz_temp_buf[psz_end - psz_beg] = '\0';
+                sprintf(sz_send_buf, fmt_reply_200, "text/plain", strlen(sz_temp_buf), sz_temp_buf);
                 sz_send_message = sz_send_buf;
             } else {
                 printf("parse error: can't find header User-Agent\n");
-                return NULL;
+                sz_send_message = reply_404;
+            }
+        } else if (strncmp(sz_recv_buf, REQ_FILE, strlen(REQ_FILE)) == 0) {
+            char const* const psz_beg = strstr(sz_recv_buf, REQ_FILE) + strlen(REQ_FILE);
+            char const* const psz_end = strstr(psz_beg, " ");
+            if (psz_end != NULL && g_args.file_path != NULL) {
+                LOCAL_STR_N_COPY(psz_beg, psz_end - psz_beg, file_name);
+                LOCAL_STR_CONCAT(g_args.file_path, file_name, sz_full_path);
+                printf("[REQ_FILE]: try load from file: %s\n", file_name);
+                size_t buf_size;
+                if (file_exists(sz_full_path) && (buf_size = file_size(sz_full_path)) != (size_t)-1) {
+                    printf("[REQ_FILE] load from file full path: %s\n", sz_full_path);
+                    char sz_temp_buf[buf_size + 1];
+                    read_file(sz_full_path, sz_temp_buf, buf_size);
+                    sz_temp_buf[buf_size] = '\0';
+                    printf("<Length:%lu>\n=== read content: ===\n%s\n=====================\n", buf_size, sz_temp_buf);
+                    sprintf(sz_send_buf, fmt_reply_200, "application/octet-stream", strlen(sz_temp_buf), sz_temp_buf);
+                    sz_send_message = sz_send_buf;
+                } else {
+                    printf("[REQ_FILE]: file `%s` doesn't exists\n", file_name);
+                    sz_send_message = reply_404;
+                }
+            } else {
+                printf("[REQ_FILE]: get files requires path arguments '--directory'\n");
+                sz_send_message = reply_404;
             }
         } else if (strncmp(sz_recv_buf, REQ_ECHO, strlen(REQ_ECHO)) == 0) {
             // first char after request str
             char const* const sz_echo_str = strtok(sz_recv_buf + strlen(REQ_ECHO), " ");
             if (sz_echo_str) {
-                sprintf(sz_send_buf, fmt_reply_200, (int)strlen(sz_echo_str), sz_echo_str);
+                sprintf(sz_send_buf, fmt_reply_200, "text/plain", strlen(sz_echo_str), sz_echo_str);
                 sz_send_message = sz_send_buf;
             }
         } else if (strncmp(sz_recv_buf, REQ_ROOT, strlen(REQ_ROOT)) == 0) {
@@ -106,20 +209,23 @@ void* handle_connection(void* pclient_fd)
 
 /*** exec ***/
 
-int main()
+int main(int argc, char* argv[])
 {
     // Disable output buffering
     setbuf(stdout, NULL);
     setbuf(stderr, NULL);
 
-    int server_fd, client_fd;
+    parse_args(argc, argv);
+
+    int server_fd,
+        client_fd;
     socklen_t client_addr_len;
     struct sockaddr_in client_addr;
 
     server_fd = socket(AF_INET, SOCK_STREAM, 0);
     if (server_fd == -1) {
         printf("Socket creation failed: %s...\n", strerror(errno));
-        return 1;
+        goto SAFE_RETURN;
     }
 
     // Since the tester restarts your program quite often, setting SO_REUSEADDR
@@ -127,7 +233,7 @@ int main()
     int reuse = 1;
     if (setsockopt(server_fd, SOL_SOCKET, SO_REUSEADDR, &reuse, sizeof(reuse)) < 0) {
         printf("SO_REUSEADDR failed: %s \n", strerror(errno));
-        return 1;
+        goto SAFE_RETURN;
     }
 
     struct sockaddr_in serv_addr = {
@@ -138,13 +244,13 @@ int main()
 
     if (bind(server_fd, (struct sockaddr*)&serv_addr, sizeof(serv_addr)) != 0) {
         printf("Bind failed: %s \n", strerror(errno));
-        return 1;
+        goto SAFE_RETURN;
     }
 
     int connection_backlog = 5;
     if (listen(server_fd, connection_backlog) != 0) {
         printf("Listen failed: %s \n", strerror(errno));
-        return 1;
+        goto SAFE_RETURN;
     }
 
     printf("Waiting for a client to connect...\n");
@@ -175,6 +281,9 @@ int main()
     }
 
     close(server_fd);
+
+SAFE_RETURN:
+    free_resource();
 
     return 0;
 }
