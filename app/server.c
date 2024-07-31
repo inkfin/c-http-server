@@ -9,6 +9,7 @@
 #include <sys/select.h>
 #include <sys/socket.h>
 #include <unistd.h>
+#include <zlib.h>
 
 /*** defines ***/
 
@@ -33,7 +34,7 @@ char const* const fmt_reply_200 =
     "HTTP/1.1 200 OK\r\n"
     /* Headers */
     "Content-Type: %s\r\n"
-    "Content-Length: %lu\r\n"
+    "Content-Length: %s\r\n"
     "%s"
     "\r\n"
     /* Response body */
@@ -119,7 +120,7 @@ int parse_args(int argc, char* argv[])
         // no arguments early return
         return 0;
     }
-    for (size_t i = 1; i < argc; ++i) {
+    for (int i = 1; i < argc; ++i) {
         if (strncmp(argv[i], "--", 2) == 0) {
             if (strcmp(argv[i] + 2, "directory") == 0 && i + 1 < argc) {
                 g_args.file_path = malloc(strlen(argv[i + 1]) + 1);
@@ -170,7 +171,7 @@ int read_file(char* file_path, char* buffer, size_t buf_size)
 {
     FILE* fp = fopen(file_path, "r");
     if (fp != NULL) {
-        size_t new_len = fread(buffer, sizeof(char), buf_size, fp);
+        fread(buffer, sizeof(char), buf_size, fp);
         if (ferror(fp) != 0) {
             fputs("[Error] read_file", stderr);
             return -1;
@@ -188,6 +189,78 @@ int write_file(char* file_path, char* buffer)
         fclose(fp);
     }
     return 0;
+}
+
+/*** file compression ***/
+
+int compress_to_gzip(const char* input, int input_size, char* output, int output_size)
+{
+    z_stream zs = {
+        .zalloc = Z_NULL,
+        .zfree = Z_NULL,
+        .opaque = Z_NULL,
+        .avail_in = (uInt)input_size,
+        .next_in = (Bytef*)input,
+        .avail_out = (uInt)output_size,
+        .next_out = (Bytef*)output,
+    };
+    deflateInit2(&zs, Z_DEFAULT_COMPRESSION, Z_DEFLATED, 15 | 16, 8, Z_DEFAULT_STRATEGY);
+    deflate(&zs, Z_FINISH);
+    deflateEnd(&zs);
+    return zs.total_out;
+}
+
+size_t compress_body(char* request, int accept_encoding)
+{
+    size_t new_size;
+
+    // insert header
+    {
+        char append_str[] = "Content-Encoding: gzip\r\n";
+
+        char* p_header_end = strstr(request, "\r\n\r\n") + 2; // to insert location
+        size_t body_len = strlen(request) - (p_header_end - request);
+        char tmp_str[body_len + 1];
+
+        // insert Content-Encoding
+        strcpy(tmp_str, p_header_end);
+        strcpy(p_header_end, append_str);
+        strcpy(p_header_end + strlen(append_str), tmp_str);
+        printf("[INFO][compress_body] HTTP request with Content-Encoding:\n%s<end>\n", request);
+    }
+
+    // compression
+    {
+        char* p_body_start = strstr(request, "\r\n\r\n") + 4;
+        size_t body_start_off = p_body_start - request;
+        size_t body_len = strlen(p_body_start) - body_start_off;
+
+        char request_header[BUFFER_SIZE + 1];
+        char compressed_body[BUFFER_SIZE - body_start_off + 1];
+        strncpy(request_header, request, body_start_off); // copy from beg to body
+
+        printf("[INFO][compress_body] HTTP body before compression <length=%lu>\n", strlen(p_body_start));
+        size_t compressed_size;
+        if (accept_encoding & ENCODING_TYPE_GZIP) {
+            compressed_size = compress_to_gzip(p_body_start, strlen(p_body_start), compressed_body, (BUFFER_SIZE - body_start_off));
+        }
+        printf("[INFO][compress_body] HTTP body after compression  <length=%lu>\n", compressed_size);
+
+        // put Content-Length
+        sprintf(request, request_header, compressed_size);
+        printf("[INFO][compress_body] Append Content-Encoding to response:\n%s<end>\n", request);
+
+        // copy compressed body back to send buffer
+        p_body_start = strstr(request, "\r\n\r\n") + 4;
+        body_start_off = p_body_start - request;
+        memset(p_body_start, 0, BUFFER_SIZE - body_start_off);
+        memcpy(p_body_start, compressed_body, compressed_size);
+        printf("[INFO][compress_body] finished copy compressed body\n");
+
+        new_size = body_start_off + compressed_size;
+    }
+
+    return new_size;
 }
 
 /*** header parser ***/
@@ -359,11 +432,11 @@ void* handle_connection(void* p_tparams)
     int client_fd = ((tParams*)p_tparams)->client_fd;
 
     while (1) {
-        char sz_recv_buf[BUFFER_SIZE];
-        char sz_send_buf[BUFFER_SIZE];
+        char sz_recv_buf[BUFFER_SIZE + 1];
+        char sz_send_buf[BUFFER_SIZE + 1];
         char const* sz_send_message = reply_404;
 
-        ssize_t const recv_numbytes = recv(client_fd, sz_recv_buf, BUFFER_SIZE - 1, 0);
+        ssize_t const recv_numbytes = recv(client_fd, sz_recv_buf, BUFFER_SIZE, 0);
         if (recv_numbytes == -1) {
             printf("Recv failed: %s \n", strerror(errno));
             break;
@@ -381,10 +454,20 @@ void* handle_connection(void* p_tparams)
 
         headerData* palloc_hd = parse_request(sz_recv_buf);
         if (palloc_hd != NULL) {
+
+            char sz_content_length[30] = "\%lu";
+            int b_need_compress = 0;
+            if (palloc_hd->accept_encoding != ENCODING_TYPE_UNDEF) {
+                b_need_compress = 1;
+            }
+
             if (palloc_hd->req_type == REQ_TYPE_GET) {
                 /* GET */
                 if (strcmp(palloc_hd->request, REQ_USER_AGENT) == 0) {
-                    fill_fmt_reply_200(sz_send_buf, "text/plain", strlen(palloc_hd->user_agent), "", palloc_hd->user_agent);
+                    if (!b_need_compress) {
+                        sprintf(sz_content_length, "%lu", strlen(palloc_hd->user_agent));
+                    }
+                    fill_fmt_reply_200(sz_send_buf, "text/plain", sz_content_length, "", palloc_hd->user_agent);
                     sz_send_message = sz_send_buf;
                 } else if (strncmp(palloc_hd->request, REQ_FILE, strlen(REQ_FILE)) == 0) {
                     if (g_args.file_path == NULL) {
@@ -401,7 +484,11 @@ void* handle_connection(void* p_tparams)
                             read_file(sz_full_path, sz_temp_buf, buf_size);
                             sz_temp_buf[buf_size] = '\0';
                             printf("=== read content: ===\n%s\n=====================\n", sz_temp_buf);
-                            fill_fmt_reply_200(sz_send_buf, "application/octet-stream", strlen(sz_temp_buf), "", sz_temp_buf);
+
+                            if (!b_need_compress) {
+                                sprintf(sz_content_length, "%lu", strlen(sz_temp_buf));
+                            }
+                            fill_fmt_reply_200(sz_send_buf, "application/octet-stream", sz_content_length, "", sz_temp_buf);
                             sz_send_message = sz_send_buf;
                         } else {
                             printf("[ERROR][REQ_GET_FILE]: file `%s` doesn't exists\n", file_name);
@@ -410,7 +497,10 @@ void* handle_connection(void* p_tparams)
                     }
                 } else if (strncmp(palloc_hd->request, REQ_ECHO, strlen(REQ_ECHO)) == 0) {
                     char const* const sz_echo_str = palloc_hd->request + strlen(REQ_ECHO);
-                    fill_fmt_reply_200(sz_send_buf, "text/plain", strlen(sz_echo_str), "", sz_echo_str);
+                    if (!b_need_compress) {
+                        sprintf(sz_content_length, "%lu", strlen(sz_echo_str));
+                    }
+                    fill_fmt_reply_200(sz_send_buf, "text/plain", sz_content_length, "", sz_echo_str);
                     sz_send_message = sz_send_buf;
                 } else if (strcmp(palloc_hd->request, REQ_ROOT) == 0) {
                     sz_send_message = reply_200;
@@ -445,31 +535,37 @@ void* handle_connection(void* p_tparams)
             }
 
             // http compression
-            if (palloc_hd->accept_encoding & ENCODING_TYPE_GZIP) {
-                char append_str[] = "Content-Encoding: gzip\r\n";
-                size_t trailing_len = strlen(sz_send_buf) - (append_str - sz_send_buf);
-                char tmp_str[trailing_len + 1];
-
-                char* p_appheader = strstr(sz_send_message, "\r\n\r\n");
-                if (p_appheader) {
-                    p_appheader += 2; // get to insert location
-                    strcpy(tmp_str, p_appheader);
-                    printf("tmp_str after copy:\n%s<end>\n", tmp_str);
-                    strcpy(p_appheader, append_str);
-                    strcpy(p_appheader + strlen(append_str), tmp_str);
+            if (b_need_compress) {
+                // only if send message has body
+                size_t new_size = strlen(palloc_hd->body);
+                if (sz_send_message == sz_send_buf) {
+                    new_size = compress_body(sz_send_buf, palloc_hd->accept_encoding);
+                    printf("[INFO] sz_send_message is:\n%s<end>\n", sz_send_message);
                 }
-                printf("Append Content-Encoding to response:\n%s<end>\n", sz_send_message);
-            }
 
-            const int sent_numbytes = send(client_fd, sz_send_message, strlen(sz_send_message), 0);
-            if (sent_numbytes == -1) {
-                printf("Send failed: %s \n", strerror(errno));
+                // send
+                const int sent_numbytes = send(client_fd, sz_send_message, new_size, 0);
+                if (sent_numbytes == -1) {
+                    printf("Send failed: %s \n", strerror(errno));
+                } else {
+                    printf("Send message success:\n"
+                           "/***content-beg***/\n"
+                           "%s<end>\n"
+                           "/***content-end***/\n",
+                        sz_send_message);
+                }
             } else {
-                printf("Send message success:\n"
-                       "/***content-beg***/\n"
-                       "%s<end>\n"
-                       "/***content-end***/\n",
-                    sz_send_message);
+                // dont' need compression
+                const int sent_numbytes = send(client_fd, sz_send_message, strlen(sz_send_message), 0);
+                if (sent_numbytes == -1) {
+                    printf("Send failed: %s \n", strerror(errno));
+                } else {
+                    printf("Send message success:\n"
+                           "/***content-beg***/\n"
+                           "%s<end>\n"
+                           "/***content-end***/\n",
+                        sz_send_message);
+                }
             }
         }
         free_header_data(palloc_hd);
