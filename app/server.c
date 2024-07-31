@@ -23,7 +23,8 @@
 
 /*** constants ***/
 
-char const* const reply_200 = "HTTP/1.1 200 OK\r\n\r\n";
+char const* const reply_200
+    = "HTTP/1.1 200 OK\r\n\r\n";
 char const* const reply_201 = "HTTP/1.1 201 Created\r\n\r\n";
 char const* const reply_404 = "HTTP/1.1 404 Not Found\r\n\r\n";
 
@@ -55,10 +56,8 @@ typedef enum {
     HTTP_V11, /* HTTP/1.1 */
 } HTTP_VERSION;
 
-typedef enum {
-    ENCODING_TYPE_UNDEF,
-    ENCODING_TYPE_GZIP,
-} ENCODING_TYPE;
+int const ENCODING_TYPE_UNDEF = 0x0;
+int const ENCODING_TYPE_GZIP = 0x1;
 
 /*** structs ***/
 
@@ -222,12 +221,22 @@ int parse_header(char const* const header_beg, char** end_ptr, headerData* data)
             data->accept[p_line_end - p_line_beg] = '\0';
             printf("data->accept = |%s|\n", data->accept);
         } else if (MATCH_STRING("Accept-Encoding")) {
-            if (strncmp(p_line_beg, "gzip", (p_line_end - p_line_beg)) == 0) {
-                data->accept_encoding = ENCODING_TYPE_GZIP;
-                printf("data->accept_encoding = ENCODING_TYPE_GZIP\n");
-            } else {
-                printf("data->accept_encoding = ENCODING_TYPE_UNDEF\n");
+            char tmp_str[p_line_end - p_line_beg + 1];
+            memcpy(tmp_str, p_line_beg, (p_line_end - p_line_beg));
+            tmp_str[p_line_end - p_line_beg] = '\0';
+            char* token = strtok(tmp_str, ", ");
+            printf("data->accept_encoding = ");
+            while (token != NULL) {
+                if (strcmp(token, "gzip") == 0) {
+                    data->accept_encoding |= ENCODING_TYPE_GZIP;
+                    printf("ENCODING_TYPE_GZIP | ");
+                }
+                token = strtok(NULL, ", ");
             }
+            if (data->accept_encoding == ENCODING_TYPE_UNDEF) {
+                printf("ENCODING_TYPE_UNDEF");
+            }
+            printf("\n");
         } else if (MATCH_STRING("Content-Type")) {
             data->content_type = malloc(sizeof(char) * (p_line_end - p_line_beg + 1));
             memcpy(data->content_type, p_line_beg, (p_line_end - p_line_beg));
@@ -435,8 +444,8 @@ void* handle_connection(void* p_tparams)
                 sz_send_message = reply_404;
             }
 
-            // compression
-            if (palloc_hd->accept_encoding == ENCODING_TYPE_GZIP) {
+            // http compression
+            if (palloc_hd->accept_encoding & ENCODING_TYPE_GZIP) {
                 char append_str[] = "Content-Encoding: gzip\r\n";
                 size_t trailing_len = strlen(sz_send_buf) - (append_str - sz_send_buf);
                 char tmp_str[trailing_len + 1];
