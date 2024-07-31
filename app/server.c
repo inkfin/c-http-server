@@ -33,9 +33,13 @@ char const* const fmt_reply_200 =
     /* Headers */
     "Content-Type: %s\r\n"
     "Content-Length: %lu\r\n"
+    "%s"
     "\r\n"
     /* Response body */
     "%s";
+
+#define fill_fmt_reply_200(out_buf, content_type, content_length, extra_headers, body) \
+    sprintf(out_buf, fmt_reply_200, content_type, content_length, extra_headers, body);
 
 /*** enums ***/
 
@@ -51,6 +55,11 @@ typedef enum {
     HTTP_V11, /* HTTP/1.1 */
 } HTTP_VERSION;
 
+typedef enum {
+    ENCODING_TYPE_UNDEF,
+    ENCODING_TYPE_GZIP,
+} ENCODING_TYPE;
+
 /*** structs ***/
 
 typedef struct {
@@ -62,6 +71,7 @@ typedef struct {
     char* host;
     char* user_agent;
     char* accept;
+    int accept_encoding;
     char* content_type;
     size_t content_length;
     /* request body */
@@ -194,7 +204,7 @@ int parse_header(char const* const header_beg, char** end_ptr, headerData* data)
         char const* const p_type_beg = p_line_beg;
         char const* const p_type_end = strchr(p_type_beg, ':');
 
-        p_line_beg = p_type_end + 2;
+        p_line_beg = p_type_end + 2; // skip ": "
 
         if (MATCH_STRING("Host")) {
             data->host = malloc(sizeof(char) * (p_line_end - p_line_beg + 1));
@@ -211,6 +221,13 @@ int parse_header(char const* const header_beg, char** end_ptr, headerData* data)
             memcpy(data->accept, p_line_beg, (p_line_end - p_line_beg));
             data->accept[p_line_end - p_line_beg] = '\0';
             printf("data->accept = |%s|\n", data->accept);
+        } else if (MATCH_STRING("Accept-Encoding")) {
+            if (strncmp(p_line_beg, "gzip", (p_line_end - p_line_beg)) == 0) {
+                data->accept_encoding = ENCODING_TYPE_GZIP;
+                printf("data->accept_encoding = ENCODING_TYPE_GZIP\n");
+            } else {
+                printf("data->accept_encoding = ENCODING_TYPE_UNDEF\n");
+            }
         } else if (MATCH_STRING("Content-Type")) {
             data->content_type = malloc(sizeof(char) * (p_line_end - p_line_beg + 1));
             memcpy(data->content_type, p_line_beg, (p_line_end - p_line_beg));
@@ -358,7 +375,7 @@ void* handle_connection(void* p_tparams)
             if (palloc_hd->req_type == REQ_TYPE_GET) {
                 /* GET */
                 if (strcmp(palloc_hd->request, REQ_USER_AGENT) == 0) {
-                    sprintf(sz_send_buf, fmt_reply_200, "text/plain", strlen(palloc_hd->user_agent), palloc_hd->user_agent);
+                    fill_fmt_reply_200(sz_send_buf, "text/plain", strlen(palloc_hd->user_agent), "", palloc_hd->user_agent);
                     sz_send_message = sz_send_buf;
                 } else if (strncmp(palloc_hd->request, REQ_FILE, strlen(REQ_FILE)) == 0) {
                     if (g_args.file_path == NULL) {
@@ -375,7 +392,7 @@ void* handle_connection(void* p_tparams)
                             read_file(sz_full_path, sz_temp_buf, buf_size);
                             sz_temp_buf[buf_size] = '\0';
                             printf("=== read content: ===\n%s\n=====================\n", sz_temp_buf);
-                            sprintf(sz_send_buf, fmt_reply_200, "application/octet-stream", strlen(sz_temp_buf), sz_temp_buf);
+                            fill_fmt_reply_200(sz_send_buf, "application/octet-stream", strlen(sz_temp_buf), "", sz_temp_buf);
                             sz_send_message = sz_send_buf;
                         } else {
                             printf("[ERROR][REQ_GET_FILE]: file `%s` doesn't exists\n", file_name);
@@ -384,7 +401,7 @@ void* handle_connection(void* p_tparams)
                     }
                 } else if (strncmp(palloc_hd->request, REQ_ECHO, strlen(REQ_ECHO)) == 0) {
                     char const* const sz_echo_str = palloc_hd->request + strlen(REQ_ECHO);
-                    sprintf(sz_send_buf, fmt_reply_200, "text/plain", strlen(sz_echo_str), sz_echo_str);
+                    fill_fmt_reply_200(sz_send_buf, "text/plain", strlen(sz_echo_str), "", sz_echo_str);
                     sz_send_message = sz_send_buf;
                 } else if (strcmp(palloc_hd->request, REQ_ROOT) == 0) {
                     sz_send_message = reply_200;
@@ -416,6 +433,23 @@ void* handle_connection(void* p_tparams)
             } else {
                 puts("[ERROR]: Request type undefined");
                 sz_send_message = reply_404;
+            }
+
+            // compression
+            if (palloc_hd->accept_encoding == ENCODING_TYPE_GZIP) {
+                char append_str[] = "Content-Encoding: gzip\r\n";
+                size_t trailing_len = strlen(sz_send_buf) - (append_str - sz_send_buf);
+                char tmp_str[trailing_len + 1];
+
+                char* p_appheader = strstr(sz_send_message, "\r\n\r\n");
+                if (p_appheader) {
+                    p_appheader += 2; // get to insert location
+                    strcpy(tmp_str, p_appheader);
+                    printf("tmp_str after copy:\n%s<end>\n", tmp_str);
+                    strcpy(p_appheader, append_str);
+                    strcpy(p_appheader + strlen(append_str), tmp_str);
+                }
+                printf("Append Content-Encoding to response:\n%s<end>\n", sz_send_message);
             }
 
             const int sent_numbytes = send(client_fd, sz_send_message, strlen(sz_send_message), 0);
